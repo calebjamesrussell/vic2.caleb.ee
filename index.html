@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -213,8 +214,6 @@
 
         #panel-title-link {
             flex: 1;
-        }
-
             color: var(--osrs-header);
             text-decoration: none;
             transition: color 0.2s;
@@ -229,6 +228,22 @@
             padding: 15px;
             color: var(--osrs-text);
             background-color: var(--osrs-input-bg);
+        }
+
+        /* Spinner Styles */
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            border-left-color: var(--osrs-title);
+            animation: spin 1s linear infinite;
+            margin: 15px auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
 
         @media (max-width: 900px) {
@@ -250,8 +265,12 @@
         <input type="file" id="saveFile" accept=".v2" onchange="processSaveFile()">
     </div>
 
-    <div id="output">
-        </div>
+    <div id="loadingUI" style="display: none; text-align: center; padding: 20px; color: var(--osrs-title); font-weight: bold; font-size: 1.2rem; background: var(--osrs-input-bg); border: 2px solid var(--osrs-border);">
+        <p>Parsing 100 years of geopolitical data...</p>
+        <div class="spinner"></div>
+    </div>
+
+    <div id="output"></div>
 </div>
 
 <div id="country-panel">
@@ -401,7 +420,7 @@
 
         provinces.forEach(p => {
             let provinceName = p.name || `Province ${p.id}`;
-            let coords = provinceCoords[provinceName];
+            let coords = provinceCoords[provinceName]; // Imported from coordinates.js
             if (!coords) {
                 const lowerKey = Object.keys(provinceCoords).find(k => k.toLowerCase() === provinceName.toLowerCase());
                 if (lowerKey) coords = provinceCoords[lowerKey];
@@ -446,191 +465,205 @@
         const fileInput = document.getElementById('saveFile');
         const output = document.getElementById('output');
         const tagSelect = document.getElementById('countryTag');
+        const loadingUI = document.getElementById('loadingUI');
 
         if (!fileInput.files.length) return;
 
         const file = fileInput.files[0];
-        output.innerHTML = '<div style="padding: 20px; background: var(--osrs-input-bg); border: 2px solid var(--osrs-border);">Reading and indexing file...</div>';
+        output.innerHTML = '';
+        loadingUI.style.display = 'block';
         
         tagSelect.innerHTML = '<option value="">Processing...</option>';
         tagSelect.disabled = true;
 
-        const reader = new FileReader();
-        reader.onload = function(e) {
-            window.rawSaveText = e.target.result; 
+        // Embedded Web Worker Logic
+        const workerCode = `
+        self.onmessage = async function(e) {
+            try {
+                const file = e.data.file;
+                const text = await file.text();
+                
+                let globalWarsData = [];
+                let globalProvincesData = {};
+                let availableTags = new Set();
+                let playerTag = null;
 
-            setTimeout(() => {
-                try { parseEntireSave(e.target.result); } 
-                catch (error) { output.innerHTML = `<div style="padding: 20px; color: red;">Error: ${error.message}</div>`; }
-            }, 50);
+                const playerMatch = text.substring(0, 5000).match(/player="([A-Z0-9]{3})"/);
+                if (playerMatch) playerTag = playerMatch[1];
+
+                let inWarBlock = false, inBattleBlock = false;
+                let inAttackerBlock = false, inDefenderBlock = false;
+                let warDepth = 0, battleDepth = 0, bracketDepth = 0;
+                let currentWar = null, currentBattle = {};
+
+                const lines = text.split(/\\r?\\n/);
+
+                for (let i = 0; i < lines.length; i++) {
+                    let line = lines[i].trim();
+
+                    if (line.includes("{")) bracketDepth += (line.match(/\\{/g) || []).length;
+                    if (line.includes("}")) {
+                        bracketDepth -= (line.match(/\\}/g) || []).length;
+                        if (inWarBlock && bracketDepth < warDepth) {
+                            inWarBlock = false;
+                            if (Object.keys(currentWar.participants).length > 0) globalWarsData.push(currentWar);
+                            currentWar = null;
+                        }
+                    }
+
+                    if (line.startsWith("previous_war=") || line.startsWith("active_war=")) {
+                        inWarBlock = true;
+                        warDepth = bracketDepth + (!line.includes("{") ? 1 : 0);
+                        currentWar = { id: globalWarsData.length, name: "Unknown War", participants: {}, startYear: 9999, endYear: 0, battles: [] };
+                        continue;
+                    }
+
+                    if (inWarBlock) {
+                        if (line.startsWith("name=") && currentWar.name === "Unknown War") currentWar.name = line.split("=")[1].replace(/"/g, '');
+                        let dateMatch = line.match(/(18\\d{2}|19\\d{2})\\.\\d{1,2}\\.\\d{1,2}/);
+                        if (dateMatch) {
+                            let year = parseInt(dateMatch[1]);
+                            if (year >= 1836 && year <= 1936) { 
+                                if (year < currentWar.startYear) currentWar.startYear = year;
+                                if (year > currentWar.endYear) currentWar.endYear = year;
+                            }
+                        }
+
+                        if (line.startsWith("battle=")) {
+                            inBattleBlock = true; battleDepth = bracketDepth;
+                            currentBattle = { name: "Unknown Location", attacker: "", attacker_losses: 0, defender: "", defender_losses: 0 };
+                        }
+
+                        if (inBattleBlock) {
+                            if (line.startsWith("name=")) currentBattle.name = line.split("=")[1].replace(/"/g, '');
+                            if (line.startsWith("result=")) currentBattle.result = line.split("=")[1].replace(/"/g, ''); 
+                            
+                            if (line.startsWith("attacker=")) { inAttackerBlock = true; inDefenderBlock = false; } 
+                            else if (line.startsWith("defender=")) { inAttackerBlock = false; inDefenderBlock = true; }
+                            
+                            if (line.startsWith("country=")) {
+                                const country = line.split("=")[1].replace(/"/g, '');
+                                if (inAttackerBlock) currentBattle.attacker = country; else if (inDefenderBlock) currentBattle.defender = country;
+                            }
+                            if (line.startsWith("leader=")) {
+                                const leader = line.split("=")[1].replace(/"/g, '');
+                                if (inAttackerBlock) currentBattle.attacker_leader = leader; else if (inDefenderBlock) currentBattle.defender_leader = leader;
+                            }
+                            if (line.startsWith("losses=")) {
+                                const losses = parseInt(line.split("=")[1]);
+                                if (inAttackerBlock) currentBattle.attacker_losses = losses; else if (inDefenderBlock) currentBattle.defender_losses = losses;
+                            }
+
+                            if (bracketDepth <= battleDepth && line === "}") {
+                                inBattleBlock = false; inAttackerBlock = false; inDefenderBlock = false;
+                                const att = currentBattle.attacker, def = currentBattle.defender;
+                                if (att && def) {
+                                    availableTags.add(att); availableTags.add(def);
+                                    if (!currentWar.participants[att]) currentWar.participants[att] = { kills: 0, deaths: 0 };
+                                    if (!currentWar.participants[def]) currentWar.participants[def] = { kills: 0, deaths: 0 };
+                                    currentWar.participants[att].deaths += currentBattle.attacker_losses;
+                                    currentWar.participants[att].kills += currentBattle.defender_losses;
+                                    currentWar.participants[def].deaths += currentBattle.defender_losses;
+                                    currentWar.participants[def].kills += currentBattle.attacker_losses;
+                                    
+                                    if (!currentBattle.attacker_leader) currentBattle.attacker_leader = "No Commander";
+                                    if (!currentBattle.defender_leader) currentBattle.defender_leader = "No Commander";
+                                    
+                                    currentWar.battles.push({...currentBattle});
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (/^\\d+=$/.test(line)) {
+                        let provinceId = line.replace('=', '');
+                        let province = { id: provinceId };
+                        
+                        i++; 
+                        let bCount = 1;
+                        
+                        while (i < lines.length && bCount > 0) {
+                            i++;
+                            line = lines[i].trim();
+                            
+                            if (line.includes('{')) bCount++;
+                            if (line.includes('}')) bCount--;
+                            
+                            if (bCount === 1) {
+                                if (line.startsWith('name=')) {
+                                    province.name = line.split('=')[1].replace(/"/g, '');
+                                } else if (line.startsWith('owner=')) {
+                                    province.owner = line.split('=')[1].replace(/"/g, '');
+                                }
+                            }
+                        }
+                        
+                        if (province.owner) {
+                            if (!globalProvincesData[province.owner]) {
+                                globalProvincesData[province.owner] = [];
+                            }
+                            globalProvincesData[province.owner].push(province);
+                        }
+                    }
+                }
+                
+                self.postMessage({
+                    status: 'success',
+                    data: {
+                        wars: globalWarsData,
+                        provinces: globalProvincesData,
+                        tags: Array.from(availableTags).sort(),
+                        playerTag: playerTag,
+                        rawText: text
+                    }
+                });
+            } catch (err) {
+                self.postMessage({ status: 'error', message: err.message });
+            }
         };
-        reader.readAsText(file, "windows-1252");
-    }
+        `;
 
-    function parseEntireSave(text) {
-        globalWarsData = [];
-        globalProvincesData = {};
-        let availableTags = new Set();
-        let playerTag = null;
-        const playerMatch = text.substring(0, 5000).match(/player="([A-Z0-9]{3})"/);
-        if (playerMatch) playerTag = playerMatch[1];
+        const blob = new Blob([workerCode], { type: 'application/javascript' });
+        const worker = new Worker(URL.createObjectURL(blob));
 
-        let inWarBlock = false, inBattleBlock = false;
-        let inAttackerBlock = false, inDefenderBlock = false;
-        let warDepth = 0, battleDepth = 0, bracketDepth = 0;
-        let currentWar = null, currentBattle = {};
-
-        const lines = text.split(/\r?\n/);
-
-        for (let i = 0; i < lines.length; i++) {
-            let line = lines[i].trim();
-
-            if (line.includes("{")) bracketDepth += (line.match(/\{/g) || []).length;
-            if (line.includes("}")) {
-                bracketDepth -= (line.match(/\}/g) || []).length;
-                if (inWarBlock && bracketDepth < warDepth) {
-                    inWarBlock = false;
-                    if (Object.keys(currentWar.participants).length > 0) globalWarsData.push(currentWar);
-                    currentWar = null;
-                }
-            }
-
-            if (line.startsWith("previous_war=") || line.startsWith("active_war=")) {
-                inWarBlock = true;
-                warDepth = bracketDepth + (!line.includes("{") ? 1 : 0);
-                currentWar = { id: globalWarsData.length, name: "Unknown War", participants: {}, startYear: 9999, endYear: 0, battles: [] };
-                continue;
-            }
-
-            if (inWarBlock) {
-                if (line.startsWith("name=") && currentWar.name === "Unknown War") currentWar.name = line.split("=")[1].replace(/"/g, '');
-                let dateMatch = line.match(/(18\d{2}|19\d{2})\.\d{1,2}\.\d{1,2}/);
-                if (dateMatch) {
-                    let year = parseInt(dateMatch[1]);
-                    if (year >= 1836 && year <= 1936) { 
-                        if (year < currentWar.startYear) currentWar.startYear = year;
-                        if (year > currentWar.endYear) currentWar.endYear = year;
-                    }
-                }
-
-                if (line.startsWith("battle=")) {
-                    inBattleBlock = true; battleDepth = bracketDepth;
-                    currentBattle = { name: "Unknown Location", attacker: "", attacker_losses: 0, defender: "", defender_losses: 0 };
-                }
-
-                if (inBattleBlock) {
-                    if (line.startsWith("name=")) currentBattle.name = line.split("=")[1].replace(/"/g, '');
-                    if (line.startsWith("result=")) currentBattle.result = line.split("=")[1].replace(/"/g, ''); 
-                    
-                    if (line.startsWith("attacker=")) { inAttackerBlock = true; inDefenderBlock = false; } 
-                    else if (line.startsWith("defender=")) { inAttackerBlock = false; inDefenderBlock = true; }
-                    
-                    if (line.startsWith("country=")) {
-                        const country = line.split("=")[1].replace(/"/g, '');
-                        if (inAttackerBlock) currentBattle.attacker = country; else if (inDefenderBlock) currentBattle.defender = country;
-                    }
-                    if (line.startsWith("leader=")) {
-                        const leader = line.split("=")[1].replace(/"/g, '');
-                        if (inAttackerBlock) currentBattle.attacker_leader = leader; else if (inDefenderBlock) currentBattle.defender_leader = leader;
-                    }
-                    if (line.startsWith("losses=")) {
-                        const losses = parseInt(line.split("=")[1]);
-                        if (inAttackerBlock) currentBattle.attacker_losses = losses; else if (inDefenderBlock) currentBattle.defender_losses = losses;
-                    }
-
-                    if (bracketDepth <= battleDepth && line === "}") {
-                        inBattleBlock = false; inAttackerBlock = false; inDefenderBlock = false;
-                        const att = currentBattle.attacker, def = currentBattle.defender;
-                        if (att && def) {
-                            availableTags.add(att); availableTags.add(def);
-                            if (!currentWar.participants[att]) currentWar.participants[att] = { kills: 0, deaths: 0 };
-                            if (!currentWar.participants[def]) currentWar.participants[def] = { kills: 0, deaths: 0 };
-                            currentWar.participants[att].deaths += currentBattle.attacker_losses;
-                            currentWar.participants[att].kills += currentBattle.defender_losses;
-                            currentWar.participants[def].deaths += currentBattle.defender_losses;
-                            currentWar.participants[def].kills += currentBattle.attacker_losses;
-                            
-                            if (!currentBattle.attacker_leader) currentBattle.attacker_leader = "No Commander";
-                            if (!currentBattle.defender_leader) currentBattle.defender_leader = "No Commander";
-                            
-                            currentWar.battles.push({...currentBattle});
-                        }
-                    }
-                }
-            }
-        }
-
-        const select = document.getElementById("countryTag");
-        select.innerHTML = "";
-        let tagsArray = Array.from(availableTags).sort();
-        
-        if (tagsArray.length === 0) {
-            select.innerHTML = '<option value="">No war data found</option>';
-            document.getElementById('output').innerHTML = '<div style="padding: 20px;">No battles with casualties were found.</div>';
-            return;
-        }
-
-        tagsArray.forEach(tag => {
-            let opt = document.createElement("option");
-            opt.value = tag;
-            opt.innerText = `${getCountryName(tag)} (${tag})`;
-            if (tag === playerTag) { opt.selected = true; opt.innerText += " - Player"; }
-            select.appendChild(opt);
-        });
-
-        if (!select.value && tagsArray.length > 0) select.value = tagsArray[0];
-        select.disabled = false;
-        
-        document.getElementById('country-panel').style.display = 'block';
-        
-        globalWarsData.forEach((w, idx) => w.id = idx);
-        
-        // Parse provinces in a separate pass
-        parseProvinces(text);
-        
-        renderResults();
-    }
-
-    function parseProvinces(text) {
-        globalProvincesData = {};
-        const lines = text.split(/\r?\n/);
-        
-        for (let i = 0; i < lines.length; i++) {
-            let line = lines[i].trim();
+        worker.onmessage = function(e) {
+            loadingUI.style.display = 'none';
             
-            if (/^\d+=$/.test(line)) {
-                let provinceId = line.replace('=', '');
-                let province = { id: provinceId };
+            if (e.data.status === 'success') {
+                const result = e.data.data;
+                globalWarsData = result.wars;
+                globalProvincesData = result.provinces;
+                window.rawSaveText = result.rawText;
                 
-                // Parse the province block
-                i++; // Move to the opening brace
-                let braceCount = 1;
-                
-                while (i < lines.length && braceCount > 0) {
-                    i++;
-                    line = lines[i].trim();
-                    
-                    if (line.includes('{')) braceCount++;
-                    if (line.includes('}')) braceCount--;
-                    
-                    if (braceCount === 1) {
-                        if (line.startsWith('name=')) {
-                            province.name = line.split('=')[1].replace(/"/g, '');
-                        } else if (line.startsWith('owner=')) {
-                            province.owner = line.split('=')[1].replace(/"/g, '');
-                        }
-                    }
+                if (result.tags.length === 0) {
+                    tagSelect.innerHTML = '<option value="">No war data found</option>';
+                    output.innerHTML = '<div style="padding: 20px;">No battles with casualties were found.</div>';
+                    return;
                 }
+
+                tagSelect.innerHTML = '';
+                result.tags.forEach(tag => {
+                    let opt = document.createElement("option");
+                    opt.value = tag;
+                    opt.innerText = `${getCountryName(tag)} (${tag})`;
+                    if (tag === result.playerTag) { opt.selected = true; opt.innerText += " - Player"; }
+                    tagSelect.appendChild(opt);
+                });
+
+                if (!tagSelect.value && result.tags.length > 0) tagSelect.value = result.tags[0];
+                tagSelect.disabled = false;
                 
-                if (province.owner) {
-                    if (!globalProvincesData[province.owner]) {
-                        globalProvincesData[province.owner] = [];
-                    }
-                    globalProvincesData[province.owner].push(province);
-                    console.log('Added province', province.name, 'to', province.owner);
-                }
+                document.getElementById('country-panel').style.display = 'block';
+                
+                globalWarsData.forEach((w, idx) => w.id = idx);
+                
+                renderResults();
+            } else {
+                output.innerHTML = `<div style="padding: 20px; color: red;">Error: ${e.data.message}</div>`;
             }
-        }
+        };
+
+        worker.postMessage({ file: file });
     }
 
     function initMasterMap() {
@@ -675,7 +708,7 @@
         war.battles.forEach(b => {
             let placeName = b.name.replace(/^.*?(Battle|Siege|Liberation|Occupation)\s+of\s+/i, '').replace(/^The\s+/i, '').trim();
             
-            let coords = provinceCoords[placeName];
+            let coords = provinceCoords[placeName]; // Imported from coordinates.js
             if (!coords) {
                 const lowerKey = Object.keys(provinceCoords).find(k => k.toLowerCase() === placeName.toLowerCase());
                 if (lowerKey) coords = provinceCoords[lowerKey];
